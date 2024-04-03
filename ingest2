@@ -1,0 +1,232 @@
+{
+  "type": "workflow_collections",
+  "data": [
+    {
+      "@context": "/api/3/contexts/WorkflowCollection",
+      "@type": "WorkflowCollection",
+      "name": "Fortinet FortiSIEM 5.2.0 FortiSIEMIngestion(d81f309e-6287-4d74-9526-30a0b1ce0c8c)",
+      "description": null,
+      "visible": false,
+      "image": null,
+      "uuid": "d81f309e-6287-4d74-9526-30a0b1ce0c8c",
+      "id": 63,
+      "createDate": 1708224834.228662,
+      "modifyDate": 1708224834.228662,
+      "deletedAt": null,
+      "importedBy": [],
+      "recordTags": [],
+      "workflows": [
+        {
+          "@type": "Workflow",
+          "triggerLimit": null,
+          "name": ">> FortiSIEM > Fetch Associated events for Incident",
+          "aliasName": null,
+          "tag": "#fortinet-fortisiem #dataingestion",
+          "description": "Fetch Associated events for Incident.",
+          "isActive": true,
+          "debug": true,
+          "singleRecordExecution": false,
+          "remoteExecutableFlag": false,
+          "parameters": [
+            "incidentdata",
+            "max_events",
+            "start_time",
+            "end_time"
+          ],
+          "synchronous": false,
+          "lastModifyDate": 1711442989,
+          "collection": "/api/3/workflow_collections/d81f309e-6287-4d74-9526-30a0b1ce0c8c",
+          "versions": [],
+          "triggerStep": "/api/3/workflow_steps/79f26d79-8976-427f-9992-b22ad37ebb3f",
+          "steps": [
+            {
+              "@type": "WorkflowStep",
+              "name": "Datamapping",
+              "description": null,
+              "arguments": {
+                "for_each": {
+                  "item": "{{vars.steps.Fetch_Events_for_Incident.data}}",
+                  "__bulk": true,
+                  "parallel": false,
+                  "condition": "",
+                  "batch_size": 100
+                },
+                "resource": {
+                  "srcmac": "{{vars.item.attributes['Source MAC']}}"
+                },
+                "operation": "Append",
+                "collection": "{{vars.incidentdata['@id']}}",
+                "__recommend": [],
+                "collectionType": "/api/3/alerts",
+                "fieldOperation": [],
+                "step_variables": []
+              },
+              "status": null,
+              "top": "551",
+              "left": "797",
+              "stepType": "/api/3/workflow_step_types/b593663d-7d13-40ce-a3a3-96dece928722",
+              "group": null,
+              "uuid": "ff1ae960-9962-4012-955a-8039dda9adc4"
+            },
+            {
+              "@type": "WorkflowStep",
+              "name": "Fetch Events for Incident",
+              "description": null,
+              "arguments": {
+                "name": "Fortinet FortiSIEM",
+                "config": "d81f309e-6287-4d74-9526-30a0b1ce0c8c",
+                "params": {
+                  "to": "",
+                  "from": "",
+                  "start": 0,
+                  "timeTo": "{{vars.input.params['end_time']}}",
+                  "allData": true,
+                  "perPage": "{{vars.input.params['max_events'] | int}}",
+                  "timeFrom": "{{vars.input.params['start_time']}}",
+                  "incident_id": "{{vars.input.params.incidentdata.sourceId}}"
+                },
+                "version": "5.1.2",
+                "connector": "fortinet-fortisiem",
+                "operation": "get_associated_events",
+                "operationTitle": "Get Events For Incident",
+                "step_variables": {
+                  "fetch_event": "{{vars.steps.Fetch_Events_for_Incident.data}}"
+                }
+              },
+              "status": null,
+              "top": "165",
+              "left": "220",
+              "stepType": "/api/3/workflow_step_types/0bfed618-0316-11e7-93ae-92361f002671",
+              "group": null,
+              "uuid": "88d86af9-dad4-4066-9482-f0b59860dd9f"
+            },
+            {
+              "@type": "WorkflowStep",
+              "name": "Set Result",
+              "description": null,
+              "arguments": {
+                "incident_details": "{\"incident_data\":  {{vars.input.params.incidentdata.sourcedata | toDict}}, \"associated_events\": {{vars.fetch_event}} }"
+              },
+              "status": null,
+              "top": "291",
+              "left": "412",
+              "stepType": "/api/3/workflow_step_types/04d0cf46-b6a8-42c4-8683-60a7eaa69e8f",
+              "group": null,
+              "uuid": "9f7ae965-d01b-4b12-a1a6-1107afecac42"
+            },
+            {
+              "@type": "WorkflowStep",
+              "name": "Start",
+              "description": null,
+              "arguments": {
+                "step_variables": {
+                  "input": {
+                    "params": {
+                      "end_time": "{{ vars.end_time }}",
+                      "max_events": "{{ vars.max_events }}",
+                      "start_time": "{{ vars.start_time }}",
+                      "incidentdata": "{{ vars.incidentdata }}",
+                      "link_mitre_technique": "{{ vars.link_mitre_technique }}"
+                    }
+                  }
+                }
+              },
+              "status": null,
+              "top": "20",
+              "left": "20",
+              "stepType": "/api/3/workflow_step_types/b348f017-9a94-471f-87f8-ce88b6a7ad62",
+              "group": null,
+              "uuid": "79f26d79-8976-427f-9992-b22ad37ebb3f"
+            },
+            {
+              "@type": "WorkflowStep",
+              "name": "Update Record",
+              "description": null,
+              "arguments": {
+                "resource": {
+                  "sourcedata": "{{vars.incident_details | toJSON }}"
+                },
+                "_showJson": false,
+                "operation": "Overwrite",
+                "collection": "{{vars.incidentdata['@id']}}",
+                "collectionType": "/api/3/alerts",
+                "fieldOperation": {
+                  "recordTags": "Overwrite"
+                },
+                "step_variables": []
+              },
+              "status": null,
+              "top": "440",
+              "left": "600",
+              "stepType": "/api/3/workflow_step_types/b593663d-7d13-40ce-a3a3-96dece928722",
+              "group": null,
+              "uuid": "266dad86-7e4f-4706-97c9-1b4b8e25c48a"
+            }
+          ],
+          "routes": [
+            {
+              "@type": "WorkflowRoute",
+              "name": "Fetch Events for Incident -> Set Result",
+              "targetStep": "/api/3/workflow_steps/9f7ae965-d01b-4b12-a1a6-1107afecac42",
+              "sourceStep": "/api/3/workflow_steps/88d86af9-dad4-4066-9482-f0b59860dd9f",
+              "label": null,
+              "isExecuted": false,
+              "group": null,
+              "uuid": "6cd36e77-9582-48b6-93bd-f84b2d1a12ea"
+            },
+            {
+              "@type": "WorkflowRoute",
+              "name": "Set Result -> Update Alert",
+              "targetStep": "/api/3/workflow_steps/266dad86-7e4f-4706-97c9-1b4b8e25c48a",
+              "sourceStep": "/api/3/workflow_steps/9f7ae965-d01b-4b12-a1a6-1107afecac42",
+              "label": null,
+              "isExecuted": false,
+              "group": null,
+              "uuid": "c59ebec2-c1d2-4548-b208-cab327b93c68"
+            },
+            {
+              "@type": "WorkflowRoute",
+              "name": "Start -> Fetch Events for Incident",
+              "targetStep": "/api/3/workflow_steps/88d86af9-dad4-4066-9482-f0b59860dd9f",
+              "sourceStep": "/api/3/workflow_steps/79f26d79-8976-427f-9992-b22ad37ebb3f",
+              "label": null,
+              "isExecuted": false,
+              "group": null,
+              "uuid": "eb79f62d-649f-49f7-9e12-75b5c0803622"
+            },
+            {
+              "@type": "WorkflowRoute",
+              "name": "Update Record -> Datamapping",
+              "targetStep": "/api/3/workflow_steps/ff1ae960-9962-4012-955a-8039dda9adc4",
+              "sourceStep": "/api/3/workflow_steps/266dad86-7e4f-4706-97c9-1b4b8e25c48a",
+              "label": null,
+              "isExecuted": false,
+              "group": null,
+              "uuid": "45e6bf5c-57ee-43b5-8565-1f4b1668cbf5"
+            }
+          ],
+          "groups": [],
+          "priority": null,
+          "uuid": "3853d3e7-d6bd-4710-b1a1-a94f59db5cf2",
+          "id": 660,
+          "createUser": "/api/3/people/3451141c-bac6-467c-8d72-85e0fab569ce",
+          "createDate": 1708224837.957294,
+          "modifyUser": "/api/3/people/3451141c-bac6-467c-8d72-85e0fab569ce",
+          "modifyDate": 1711442908.304321,
+          "owners": [],
+          "isPrivate": false,
+          "deletedAt": null,
+          "importedBy": [],
+          "recordTags": [
+            "dataingestion",
+            "fortinet-fortisiem"
+          ]
+        }
+      ]
+    }
+  ],
+  "exported_tags": [
+    "dataingestion",
+    "fortinet-fortisiem"
+  ]
+}
