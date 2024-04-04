@@ -1,0 +1,14 @@
+import requests
+from connectors.core.connector import get_logger, ConnectorError
+from .constants import LOGGER_NAME
+logger = get_logger(LOGGER_NAME)
+
+
+def get_domain_list(config, params):
+    '''
+    sample..
+    
+    `curl -qgsSk --header "FeApi-Token: xxxxxxxxxxxxxxxxxxxxxxxxx=" --header "Accept:application/zip" https://
+xxx.xxx.xxx.xxx/wsapis/v2.0.0/artifacts/dce3d3d0-c362-4780-8c16-cc44ab776XXX -o file.zip`
+    '''
+    pass
