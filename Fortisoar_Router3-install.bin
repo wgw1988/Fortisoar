@@ -1,0 +1,594 @@
+#!/bin/bash
+# Copyright start
+# Copyright (C) 2008 - 2024 Fortinet Inc.
+# All rights reserved.
+# FORTINET CONFIDENTIAL & FORTINET PROPRIETARY SOURCE CODE
+# Copyright end
+
+agent_user="fortisoar"
+agent_group="fortisoar"
+prefix="/opt/cyops-integrations/"
+f_cmd_psql="/usr/bin/psql"
+pg_version=16
+pg_hba_file="/var/lib/pgsql/$pg_version/data/pg_hba.conf"
+product_version="7.6.0"
+pg_password="8fcef29a9392b7cad9ca28aa595f1f2d"
+agent_id="8fcef29a9392b7cad9ca28aa595f1f2d"
+agent_rpm_name="cyops-integrations-agent"
+product_yum_server="repo.fortisoar.fortinet.com"
+secure_message_exchange_host="fortisoar-router2"
+pwd=$(pwd)
+config_update="False"
+
+# Code -1 Pre validation failed
+# Code 1 means pre-installation
+# Code 2 means post installation
+# Code 3 means agent upgrade successful
+# Code 4 means upgrade failed or service restart failed
+# Code 5 means agent config update is in progress
+# Code 6 means agent config update successful
+# Code 7 means agent config update failed
+
+install_basic_package() {
+  yum install -y which tar sudo
+}
+
+identify_bytes_to_skip() {
+  i_bytes_to_skip=$(awk '/^__PAYLOAD_STARTS_AFTER_THIS__/ { print NR; exit 0; }' $0)
+  c_first_char=$(echo $0 | cut -c 1)
+  if [ "$c_first_char" = "/" ]; then
+    script=$0
+  else
+    script=$(pwd)/$0
+  fi
+  export script
+  export i_bytes_to_skip
+}
+
+check_if_upgrade() {
+  is_upgrade=0
+  if rpm -qa | grep -q $agent_rpm_name; then
+    is_upgrade=1
+  fi
+}
+
+extract_archive() {
+
+  if ! which tar; then
+    echo "Please ensure the tar command is installed on your machine"
+    if [ $is_upgrade -eq 1 ]; then
+      /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": -1, "status": "tar command not found on the FortiSOAR agent instance"}'
+    fi
+    exit 1
+  fi
+
+  sed "1,${i_bytes_to_skip}d" $script | tar -xzf - 2>/dev/null
+  if [ $? -ne 0 ]; then
+    echo "Extract archive failed, exiting"
+    exit 1
+  fi
+}
+
+identify_existing_agent() {
+  if [ $is_upgrade -eq 1 ]; then
+    old_agent_id=$(/opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"get_config_key": true, "key_name": "cyops.instance.agentId"}')
+    if [ "$agent_id" != "$old_agent_id" ]; then
+      echo "Found an existing installation of FortiSOAR agent with a different agent ID. The installer will exit."
+      echo "Possibly you are running the installer for another agent connected to your FortiSOAR server. Check and download the correct agent installer."
+      echo "Or, if you wish to reset the installation with the new agent ID, execute the following commands manually and then re-run the installer script."
+      echo -e "\n\n"
+      echo "rm -rf /var/lib/pgsql/$pg_version/data/"
+      echo "/usr/pgsql-$pg_version/bin/postgresql-$pg_version-setup initdb"
+
+      echo "systemctl restart postgresql-$pg_version.service"
+
+      echo "sudo -Hiu postgres psql -c 'DROP USER IF EXISTS cyberpgsql;'"
+      echo "sudo -Hiu postgres psql -U postgres -c \"CREATE USER cyberpgsql WITH SUPERUSER PASSWORD '$pg_password'\""
+      echo "sudo -Hiu postgres psql -c 'DROP DATABASE IF EXISTS connectors;'"
+      echo "sudo -Hiu postgres createdb connectors 'cyberpgsql'"
+
+      echo "> /var/lib/pgsql/$pg_version/data/pg_hba.conf"
+      echo "echo -e \"local   all             postgres                                md5 \n\nlocal   all             cyberpgsql                              md5 \n\nhost    all             cyberpgsql             127.0.0.1/32     md5\n\nhost    all             cyberpgsql             ::1/128          md5\" > /var/lib/pgsql/$pg_version/data/pg_hba.conf"
+      echo "chown postgres:postgres /var/lib/pgsql/$pg_version/data/pg_hba.conf"
+      echo "chmod 600 /var/lib/pgsql/$pg_version/data/pg_hba.conf"
+      echo "systemctl restart postgresql-$pg_version.service"
+      echo "Once done please update the new agent id in /opt/cyops-integrations/integrations/configs/agent_config.yml under cyops.instance.agentId"
+      exit 1
+    fi
+  fi
+}
+
+pre_validate_script() {
+
+  if ! curl -I --silent --connect-timeout 10 https://$product_yum_server -k >/dev/null; then
+    echo "======================================================================================================"
+    echo "Please ensure connectivity to $product_yum_server for agent installation"
+    echo "======================================================================================================"
+    if [ $is_upgrade -eq 1 ]; then
+      /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": -1, "status": "Unable to reach FortiSOAR yum server"}'
+    fi
+    exit 1
+  fi
+
+  if ! getent hosts $secure_message_exchange_host; then
+    echo "=================================================================================================="
+    echo "The Secure Message Exchange server $secure_message_exchange_host is not resolvable from this host."
+    echo "It is recommended to establish the connectivity to the router before running the agent installer."
+    echo "=================================================================================================="
+    echo "Exit the installer (y/n)?"
+    read -n 1 -r
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      echo -e '\n'
+      exit 1
+    fi
+  fi
+
+  if [ $is_upgrade -eq 1 ]; then
+    /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 1, "status": "Verified connectivity with FortiSOAR server"}'
+  fi
+}
+
+disable_existing_postgres_repo() {
+  # For Fix of following error
+  # All matches were filtered out by modular filtering for argument: postgresql14-server
+  sudo dnf -qy module disable postgresql
+  yum clean all
+}
+
+add_enable_repo() {
+  app_repo="[fsr-app]
+name=FortiSOAR Application Repository
+baseurl=https://$product_yum_server/$product_version/fortisoar/x86_64/
+gpgcheck=0
+enabled=1
+sslverify=false"
+
+  postgres_repo="[fsr-pgdg]
+name=FortiSOAR PostgreSQL repository
+baseurl=https://$product_yum_server/$product_version/third-party/postgres/pgdg$pg_version/
+enabled=1
+gpgcheck=1
+gpgkey=https://$product_yum_server/$product_version/third-party/postgres/RPM-GPG-KEY-PGDG-$pg_version
+sslverify=false"
+
+  echo "$app_repo" >/etc/yum.repos.d/fsr-app.repo
+  echo "$postgres_repo" >/etc/yum.repos.d/fsr-third-party.repo
+
+  sudo chmod 644 /etc/yum.repos.d/fsr-app.repo
+  sudo chmod 644 /etc/yum.repos.d/fsr-third-party.repo
+
+  yum clean all
+}
+
+install_configure_postgres() {
+  if ! rpm -qa | grep -q postgresql$pg_version-server; then
+    echo "======================================================================================================"
+    echo "Installing Postgres Server"
+    echo "======================================================================================================"
+    yum install -y postgresql$pg_version-server --nogpgcheck
+    if [ $? -ne 0 ]; then
+      echo "Unable to install PostgreSQL, Exiting the installer"
+      echo "Validate connectivity with $product_yum_server or check host entry"
+      exit 1
+    fi
+
+    #pg setup
+    /usr/pgsql-$pg_version/bin/postgresql-$pg_version-setup initdb
+    systemctl enable postgresql-$pg_version
+
+    if [ $is_upgrade -ne 1 ]; then
+      systemctl start postgresql-$pg_version.service
+      # create pg user
+      sudo -Hiu postgres psql -c 'DROP USER IF EXISTS cyberpgsql;'
+      sudo -Hiu postgres psql -U postgres -c "CREATE USER cyberpgsql WITH SUPERUSER PASSWORD '$pg_password'"
+      sudo -Hiu postgres psql -c 'DROP DATABASE IF EXISTS connectors;'
+      sudo -Hiu postgres createdb connectors 'cyberpgsql'
+    fi
+
+    pg_hba='local   all             postgres                                md5
+
+local   all             cyberpgsql                              md5
+
+host    all             cyberpgsql             127.0.0.1/32     md5
+
+host    all             cyberpgsql             ::1/128          md5
+'
+    >/var/lib/pgsql/$pg_version/data/pg_hba.conf
+    echo "$pg_hba" >/var/lib/pgsql/$pg_version/data/pg_hba.conf
+    chown postgres:postgres /var/lib/pgsql/$pg_version/data/pg_hba.conf
+    chmod 600 /var/lib/pgsql/$pg_version/data/pg_hba.conf
+
+    systemctl restart postgresql-$pg_version.service
+  fi
+}
+
+install_upgrade_agent() {
+  if rpm -qa | grep -q $agent_rpm_name; then
+    echo "Current version:" $(rpm -q --qf '%{version}' $agent_rpm_name)
+    if [ $is_upgrade -eq 1 ]; then
+      /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 1, "status": "Pre-validation done, starting agent upgrade."}'
+    fi
+    yum update -y $agent_rpm_name --nogpgcheck
+    if [ $? -ne 0 ]; then
+      if [ $is_upgrade -eq 1 ]; then
+        /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 4, "status": "Failed to upgrade the agent rpm package"}'
+        /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"collect_log": true, "log_path": "/var/log/cyops"}'
+      fi
+      exit 1
+    fi
+    systemctl daemon-reload
+  else
+    yum install -y $agent_rpm_name --nogpgcheck
+    if [ $? -ne 0 ]; then
+      exit 1
+    fi
+    systemctl enable $agent_rpm_name
+  fi
+}
+
+remove_repo() {
+  rm -f /etc/yum.repos.d/fsr-app.repo
+  rm -f /etc/yum.repos.d/fsr-third-party.repo
+
+  if [ $is_upgrade -eq 1 ]; then
+    echo "Notifying master: removing the added yum repos"
+    sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 1, "status": "Removing added repos"}'
+  fi
+}
+
+write_config_file() {
+  agent_config='cyops.instance.agentId: 8fcef29a9392b7cad9ca28aa595f1f2d
+cyops.instance.agentUuid: 973c17df-bb4b-41e5-b59c-a408666fdf27
+cyops.instance.lwAgent: true
+cyops.instance.masterId: 9290cd6a85727dd0a795e0b3a145847d
+cyops.instance.tenantUuid: 5cb929dd-8c88-43d0-8a88-75a29c87b4f6
+cyops.rabbitmq.authType: /api/3/picklists/0ec67016-990f-4117-a599-7b12a259d3d3
+cyops.rabbitmq.heartbeat: 120
+cyops.rabbitmq.host: fortisoar-router2
+cyops.rabbitmq.password: hUSMTVoNGfpuFjj8bYm+WTzOqU1xO4TfV+LcgeCUEYFTRMjsHgD/O3hTojiDL/D4I3dmcn23@KlS2#!ck
+cyops.rabbitmq.port: 5671
+cyops.rabbitmq.sni: fortisoar-router2
+cyops.rabbitmq.ssl: true
+cyops.rabbitmq.sslFileName: /opt/cyops-integrations/integrations/configs/ca_cert.pem
+cyops.rabbitmq.user: user_8fcef29a9392b7cad9ca28aa595f1f2d
+cyops.rabbitmq.vhost: vhost_8fcef29a9392b7cad9ca28aa595f1f2d
+postgres.pg_host: localhost
+postgres.pg_password: 8fcef29a9392b7cad9ca28aa595f1f2d
+postgres.pg_user: cyberpgsql
+'
+  ca_cert='-----BEGIN CERTIFICATE-----
+MIIC+DCCAeCgAwIBAgIUZyy9ulCLlaeFFmAFof1NvPn4OXwwDQYJKoZIhvcNAQEL
+BQAwFzEVMBMGA1UEAwwMRlNSRGVmYXVsdENBMB4XDTI0MTIwMzExMDkwNloXDTI2
+MTIwMzExMDkwNlowFzEVMBMGA1UEAwwMRlNSRGVmYXVsdENBMIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEArjUlZPhAoqWrE29tq65caAKVDx99Ua1M7zAq
+aszFuk1XgJ4ljgnFqMrrEmoVnRc/XiNLULFmSBQglUaJK2xQNOk8P7qNyCNOfRjp
+W8iBgBMyte8CoQ3jwOSZuFxIF/C52aM0AmOZxXbwHsJ8/rRl40d5Jv9ixX6l/KfI
+pNtzMZa/TOrfkT038RdZRxtzqQhFkijVrzgajPuOXvxvIfbsFMJdWOzfS168D3Cf
+9y08kWHPcKkdu4/JVGXjbwaSigjKEzpBCgq7ixhoRBnVnMkbgJJDbCKcEYs8oP4/
+khsOrFI9GTQGr9zlFBrh7Rab6BKljNz5I1LD1ekhb5f0rSob4QIDAQABozwwOjAM
+BgNVHRMEBTADAQH/MAsGA1UdDwQEAwIBBjAdBgNVHQ4EFgQUWV13cfTu/hOzRUyL
+hBk6bAOkgYIwDQYJKoZIhvcNAQELBQADggEBAGOQw0I+o0/ZSajtsoNsItvefoys
+6UmcizLHU0npicCFMmLulUhWhNOSTkNsnob1Yy3rdjbR3uYLd8o3KvK9RchRq4tQ
+GEhu1HWYkEIBnHcOXqGDMezugEIDK7Ffb37jN169r7dIAhcTnlKr7FgF6E8yWRCl
+sy854ImTBRlhfoXluxFeOZ5ck29YyBR9xqBW2Jm21//IHRFXCjA8hadeOMTqGtin
+9mhZXeIkGtC7FzVayBEqMknj7wPZvNuNas6bdWuN1s9enZXs7Q32snuMy2+zkYax
+r1HYMCJexjLBCehCAhWZz4IXY2idqWavR3Xi3ph8+uVstvmjhQ9nry8ywLo=
+-----END CERTIFICATE-----'
+  client_cert='@client_cert@'
+  client_key='@client_key@'
+  connectors=$(
+    cat <<EOF
+[{"name": "smtp", "version": "2.5.0", "rpm_full_name": "", "rpm_installed": false}, {"name": "phishing-classifier", "version": "1.1.0", "rpm_full_name": "", "rpm_installed": false}, {"name": "fsr-agent-communication-bridge", "version": "1.1.0", "rpm_full_name": "", "rpm_installed": false}, {"name": "fortisoar-ml-engine", "version": "1.2.3", "rpm_full_name": "", "rpm_installed": false}, {"name": "cyops-schedule-report", "version": "1.4.1", "rpm_full_name": "", "rpm_installed": false}, {"name": "alienvault-otx", "version": "1.0.2", "rpm_full_name": "", "rpm_installed": true}, {"name": "apivoid", "version": "1.0.2", "rpm_full_name": "", "rpm_installed": true}, {"name": "carbonblack-response", "version": "2.0.2", "rpm_full_name": "", "rpm_installed": true}, {"name": "fortinet-forticlient-ems", "version": "1.2.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "file-content-extraction", "version": "1.1.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "fortinet-fortiguard-threat-intelligence", "version": "3.1.3", "rpm_full_name": "", "rpm_installed": true}, {"name": "xforce", "version": "1.0.2", "rpm_full_name": "", "rpm_installed": true}, {"name": "ip-quality-score", "version": "1.0.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "ipstack", "version": "1.0.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "microsoft-sccm", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "mxtoolbox", "version": "2.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "nmap-scanner", "version": "1.0.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "slacalculator", "version": "2.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "urlscan-io", "version": "1.1.2", "rpm_full_name": "", "rpm_installed": true}, {"name": "whois-rdap", "version": "1.0.2", "rpm_full_name": "", "rpm_installed": true}, {"name": "syslog", "version": "1.1.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "mitre-attack", "version": "2.0.2", "rpm_full_name": "", "rpm_installed": true}, {"name": "fortisoar-soc-simulator", "version": "2.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "malsilo", "version": "2.0.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "fortinet-fortirecon-aci", "version": "1.1.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "elasticsearch", "version": "3.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "excel-tools", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "abuseipdb", "version": "2.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "alphamountain-feed", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "blocklist_de-feed", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "aws-feed", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "anomali-enterprise", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "google-bard", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "openai", "version": "3.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "chatsonic", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "nist-nvd_dev", "version": "1.1.1", "rpm_full_name": null, "rpm_installed": null}, {"name": "cicd-utils", "version": "1.1.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "github", "version": "1.3.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "gitlab", "version": "2.0.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "nist-nvd", "version": "1.0.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "anomali-limo-threat-intel-feed", "version": "2.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "bambenek-feed", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "threatstream", "version": "2.5.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "cisco-talos-feed", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "botvrij-misp-osint-feed", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "cyops_utilities", "version": "3.4.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "imap", "version": "3.5.8", "rpm_full_name": "", "rpm_installed": true}, {"name": "code-snippet", "version": "2.1.3", "rpm_full_name": "", "rpm_installed": true}, {"name": "cyops-system-monitoring", "version": "1.5.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "exchange", "version": "4.5.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "fortinet-fortiedr", "version": "2.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "fortigate-firewall", "version": "5.3.0", "rpm_full_name": null, "rpm_installed": true}, {"name": "fortinet-fortisandbox", "version": "2.1.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "fortinet-fortisiem", "version": "5.2.2", "rpm_full_name": null, "rpm_installed": true}, {"name": "virustotal", "version": "3.2.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "aiassistant-utils", "version": "3.0.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "screenshot", "version": "1.0.1", "rpm_full_name": "", "rpm_installed": true}]
+EOF
+  )
+
+  echo "$agent_config" >/opt/cyops-integrations/integrations/configs/agent_config.yml
+  echo "$ca_cert" >/opt/cyops-integrations/integrations/configs/ca_cert.pem
+  echo "$client_cert" >/opt/cyops-integrations/integrations/configs/client-cert.pem
+  echo "$client_key" >/opt/cyops-integrations/integrations/configs/client-key.pem
+  echo "$connectors" >/opt/cyops-integrations/integrations/connectors.json
+}
+
+write_tmp_dir(){
+  mkdir -p /opt/cyops-integrations/integrations/configs/tmp
+}
+
+del_tmp_dir(){
+  rm -rf /opt/cyops-integrations/integrations/configs/tmp
+}
+
+write_tmp_config_file(){
+  write_tmp_dir
+  agent_config='cyops.instance.agentId: 8fcef29a9392b7cad9ca28aa595f1f2d
+cyops.instance.agentUuid: 973c17df-bb4b-41e5-b59c-a408666fdf27
+cyops.instance.lwAgent: true
+cyops.instance.masterId: 9290cd6a85727dd0a795e0b3a145847d
+cyops.instance.tenantUuid: 5cb929dd-8c88-43d0-8a88-75a29c87b4f6
+cyops.rabbitmq.authType: /api/3/picklists/0ec67016-990f-4117-a599-7b12a259d3d3
+cyops.rabbitmq.heartbeat: 120
+cyops.rabbitmq.host: fortisoar-router2
+cyops.rabbitmq.password: hUSMTVoNGfpuFjj8bYm+WTzOqU1xO4TfV+LcgeCUEYFTRMjsHgD/O3hTojiDL/D4I3dmcn23@KlS2#!ck
+cyops.rabbitmq.port: 5671
+cyops.rabbitmq.sni: fortisoar-router2
+cyops.rabbitmq.ssl: true
+cyops.rabbitmq.sslFileName: /opt/cyops-integrations/integrations/configs/ca_cert.pem
+cyops.rabbitmq.user: user_8fcef29a9392b7cad9ca28aa595f1f2d
+cyops.rabbitmq.vhost: vhost_8fcef29a9392b7cad9ca28aa595f1f2d
+postgres.pg_host: localhost
+postgres.pg_password: 8fcef29a9392b7cad9ca28aa595f1f2d
+postgres.pg_user: cyberpgsql
+'
+  ca_cert='-----BEGIN CERTIFICATE-----
+MIIC+DCCAeCgAwIBAgIUZyy9ulCLlaeFFmAFof1NvPn4OXwwDQYJKoZIhvcNAQEL
+BQAwFzEVMBMGA1UEAwwMRlNSRGVmYXVsdENBMB4XDTI0MTIwMzExMDkwNloXDTI2
+MTIwMzExMDkwNlowFzEVMBMGA1UEAwwMRlNSRGVmYXVsdENBMIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEArjUlZPhAoqWrE29tq65caAKVDx99Ua1M7zAq
+aszFuk1XgJ4ljgnFqMrrEmoVnRc/XiNLULFmSBQglUaJK2xQNOk8P7qNyCNOfRjp
+W8iBgBMyte8CoQ3jwOSZuFxIF/C52aM0AmOZxXbwHsJ8/rRl40d5Jv9ixX6l/KfI
+pNtzMZa/TOrfkT038RdZRxtzqQhFkijVrzgajPuOXvxvIfbsFMJdWOzfS168D3Cf
+9y08kWHPcKkdu4/JVGXjbwaSigjKEzpBCgq7ixhoRBnVnMkbgJJDbCKcEYs8oP4/
+khsOrFI9GTQGr9zlFBrh7Rab6BKljNz5I1LD1ekhb5f0rSob4QIDAQABozwwOjAM
+BgNVHRMEBTADAQH/MAsGA1UdDwQEAwIBBjAdBgNVHQ4EFgQUWV13cfTu/hOzRUyL
+hBk6bAOkgYIwDQYJKoZIhvcNAQELBQADggEBAGOQw0I+o0/ZSajtsoNsItvefoys
+6UmcizLHU0npicCFMmLulUhWhNOSTkNsnob1Yy3rdjbR3uYLd8o3KvK9RchRq4tQ
+GEhu1HWYkEIBnHcOXqGDMezugEIDK7Ffb37jN169r7dIAhcTnlKr7FgF6E8yWRCl
+sy854ImTBRlhfoXluxFeOZ5ck29YyBR9xqBW2Jm21//IHRFXCjA8hadeOMTqGtin
+9mhZXeIkGtC7FzVayBEqMknj7wPZvNuNas6bdWuN1s9enZXs7Q32snuMy2+zkYax
+r1HYMCJexjLBCehCAhWZz4IXY2idqWavR3Xi3ph8+uVstvmjhQ9nry8ywLo=
+-----END CERTIFICATE-----'
+  client_cert='@client_cert@'
+  client_key='@client_key@'
+  connectors=$(
+    cat <<EOF
+[{"name": "smtp", "version": "2.5.0", "rpm_full_name": "", "rpm_installed": false}, {"name": "phishing-classifier", "version": "1.1.0", "rpm_full_name": "", "rpm_installed": false}, {"name": "fsr-agent-communication-bridge", "version": "1.1.0", "rpm_full_name": "", "rpm_installed": false}, {"name": "fortisoar-ml-engine", "version": "1.2.3", "rpm_full_name": "", "rpm_installed": false}, {"name": "cyops-schedule-report", "version": "1.4.1", "rpm_full_name": "", "rpm_installed": false}, {"name": "alienvault-otx", "version": "1.0.2", "rpm_full_name": "", "rpm_installed": true}, {"name": "apivoid", "version": "1.0.2", "rpm_full_name": "", "rpm_installed": true}, {"name": "carbonblack-response", "version": "2.0.2", "rpm_full_name": "", "rpm_installed": true}, {"name": "fortinet-forticlient-ems", "version": "1.2.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "file-content-extraction", "version": "1.1.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "fortinet-fortiguard-threat-intelligence", "version": "3.1.3", "rpm_full_name": "", "rpm_installed": true}, {"name": "xforce", "version": "1.0.2", "rpm_full_name": "", "rpm_installed": true}, {"name": "ip-quality-score", "version": "1.0.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "ipstack", "version": "1.0.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "microsoft-sccm", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "mxtoolbox", "version": "2.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "nmap-scanner", "version": "1.0.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "slacalculator", "version": "2.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "urlscan-io", "version": "1.1.2", "rpm_full_name": "", "rpm_installed": true}, {"name": "whois-rdap", "version": "1.0.2", "rpm_full_name": "", "rpm_installed": true}, {"name": "syslog", "version": "1.1.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "mitre-attack", "version": "2.0.2", "rpm_full_name": "", "rpm_installed": true}, {"name": "fortisoar-soc-simulator", "version": "2.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "malsilo", "version": "2.0.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "fortinet-fortirecon-aci", "version": "1.1.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "elasticsearch", "version": "3.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "excel-tools", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "abuseipdb", "version": "2.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "alphamountain-feed", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "blocklist_de-feed", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "aws-feed", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "anomali-enterprise", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "google-bard", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "openai", "version": "3.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "chatsonic", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "nist-nvd_dev", "version": "1.1.1", "rpm_full_name": null, "rpm_installed": null}, {"name": "cicd-utils", "version": "1.1.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "github", "version": "1.3.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "gitlab", "version": "2.0.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "nist-nvd", "version": "1.0.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "anomali-limo-threat-intel-feed", "version": "2.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "bambenek-feed", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "threatstream", "version": "2.5.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "cisco-talos-feed", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "botvrij-misp-osint-feed", "version": "1.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "cyops_utilities", "version": "3.4.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "imap", "version": "3.5.8", "rpm_full_name": "", "rpm_installed": true}, {"name": "code-snippet", "version": "2.1.3", "rpm_full_name": "", "rpm_installed": true}, {"name": "cyops-system-monitoring", "version": "1.5.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "exchange", "version": "4.5.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "fortinet-fortiedr", "version": "2.0.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "fortigate-firewall", "version": "5.3.0", "rpm_full_name": null, "rpm_installed": true}, {"name": "fortinet-fortisandbox", "version": "2.1.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "fortinet-fortisiem", "version": "5.2.2", "rpm_full_name": null, "rpm_installed": true}, {"name": "virustotal", "version": "3.2.0", "rpm_full_name": "", "rpm_installed": true}, {"name": "aiassistant-utils", "version": "3.0.1", "rpm_full_name": "", "rpm_installed": true}, {"name": "screenshot", "version": "1.0.1", "rpm_full_name": "", "rpm_installed": true}]
+EOF
+  )
+  echo "$agent_config" >/opt/cyops-integrations/integrations/configs/tmp/agent_config.yml
+  echo "$ca_cert" >/opt/cyops-integrations/integrations/configs/tmp/ca_cert.pem
+  echo "$client_cert" >/opt/cyops-integrations/integrations/configs/tmp/client-cert.pem
+  echo "$client_key" >/opt/cyops-integrations/integrations/configs/tmp/client-key.pem
+  sed -i "s/\(\/opt\/cyops\-integrations\/integrations\/configs\/\)/\1tmp\//g" /opt/cyops-integrations/integrations/configs/tmp/agent_config.yml
+}
+
+can_connect_sme(){
+    sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py "{\"code\": 1, \"status\": \"Checking if Agent can connect to SME host $(secure_message_exchange_host)\"}"
+    echo "Checking if agent can connect to SME"
+    sme_health=$(/opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"sme_health_check": true}')
+    if [ "X$sme_health" != "XTrue" ]; then
+        echo "Cannot connect to SME. Exiting update"
+        sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py "{\"code\": 7, \"status\": \"FortiSOAR Agent instance cannot connect to SME host $(secure_message_exchange_host)\"}"
+        exit 1
+    fi
+    /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py "{\"code\": 5, \"status\": \"FortiSOAR Agent instance can connect to SME host $(secure_message_exchange_host)\"}"
+    echo "Agent can connect to SME"
+    del_tmp_dir
+}
+
+restart_service() {
+  # restart service
+  echo "restarting services"
+  if [ ! "$1" = "skip_postgres_restart" ]; then
+    echo "Skipping PostgreSQL restart on subsequent restart request from installer"
+    systemctl restart postgresql-$pg_version
+  fi
+  systemctl restart $agent_rpm_name
+  if [ $? -ne 0 ]; then
+    if [ $is_upgrade -eq 1 ]; then
+      sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 4, "status": "Agent service failed to start"}'
+      sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"collect_log": true, "log_path": "/var/log/cyops"}'
+    fi
+  fi
+}
+
+databse_migrate() {
+  if [ $is_upgrade -eq 1 ]; then
+    echo "Notifying master: starting database migrations"
+    sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 2, "status": "Starting database migrations"}'
+  fi
+
+  # run migration
+  cd $prefix/integrations
+  sudo -u $agent_user $prefix/.env/bin/python3 manage.py migrate
+
+  if [ $is_upgrade -eq 1 ]; then
+    echo "Notifying master: completed database migrations"
+    sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 2, "status": "Completed database migration"}'
+  fi
+}
+
+create_cache_table() {
+  # create cache table
+  cd $prefix/integrations
+  sudo -u $agent_user $prefix/.env/bin/python3 manage.py createcachetable
+
+}
+
+install_gcc() {
+  rpm -q gcc >/dev/null
+  if [ $? -ne 0 ]; then
+    echo "======================================================================================================"
+    echo "attempting to install gcc"
+    echo "======================================================================================================"
+    yum install -y gcc >/dev/null 2>&1
+
+    if [ 0 -ne $? ]; then
+      echo "======================================================================================================"
+      echo "Failed to install GCC rpm. Some of the FortiSOAR connectors may have a dependency on gcc."
+      echo "It is recommended to install gcc by enabling the CentOS yum repositories on this instance and running 'yum install gcc -y'"
+      echo "======================================================================================================"
+    else
+      echo "successfully installed gcc"
+    fi
+  fi
+}
+
+install_update_connectors() {
+  cd /opt/cyops-integrations
+  if [ $is_upgrade -eq 1 ]; then
+    echo "Notifying master: updated utilities connector"
+    sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 2, "status": "Updating utilities connector"}'
+  fi
+  echo "Installing specified connectors"
+  sudo -u $agent_user /opt/cyops-integrations/.env/bin/python /opt/cyops-integrations/integrations/manage.py install_connector
+}
+
+install_connector_dep() {
+  echo "installing integration pip packages"
+  for requirements in $(find /opt/cyops/configs/integrations/connectors/ -name requirements.txt); do sudo -u fortisoar /opt/cyops-integrations/.env/bin/pip install -r $requirements; done
+}
+
+collect_logs() {
+  echo "Agent Deployed Successfully"
+  if [ $is_upgrade -eq 1 ]; then
+    sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 3, "status": "Agent upgraded successfully!"}'
+    sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"collect_log": true, "log_path": "/var/log/cyops"}'
+  fi
+}
+
+post_config_update() {
+  echo "Agent configuration refreshed successfully"
+  sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 6, "status": "Agent configuration refreshed successfully!"}'
+  sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"collect_log": true, "log_path": "/var/log/cyops"}'
+}
+
+move_file_to_integration() {
+  if [[ -d $prefix ]]; then
+    mv $pwd/agent_helper.py $prefix
+  fi
+}
+
+change_file_ownership() {
+  # reset all file ownership to FortiSOAR user in case new files have been created
+  chown -R $agent_user:$agent_group $prefix
+  restorecon -R $prefix
+  chown -R $agent_user:$agent_group /var/log/cyops/
+  restorecon -R $prefix /var/log/cyops
+}
+
+set_locale() {
+  export LANG=en_US.UTF-8
+  export LANGUAGE=en_US.UTF-8
+  export LC_COLLATE=C
+  export LC_CTYPE=en_US.UTF-8
+}
+
+create_csagent_symlink() {
+  ln -sf /opt/cyops-integrations/integrations/cs_sdk.py /usr/bin/csagent
+}
+
+version_compare() {
+    local s_ver1=$1
+    local s_ver2=$2
+    local a_ver1=($(echo $s_ver1 | tr '.' "\n"))
+    local a_ver2=($(echo $s_ver2 | tr '.' "\n"))
+    local i_no_of_ele_ver1=${#a_ver1[@]}
+    local i_no_of_ele_ver2=${#a_ver2[@]}
+    local i_result=0
+    if [ "X$i_no_of_ele_ver1" != "X$i_no_of_ele_ver2" ]; then
+        echo -e "version_compare sub-routine needs identical number of elements"
+        my_exit 1
+    fi
+
+    for ((i = 0; i < $i_no_of_ele_ver1; i++)); do
+        if [ ${a_ver1[$i]} -eq ${a_ver2[$i]} ]; then
+            continue
+        fi
+        if [ ${a_ver1[$i]} -gt ${a_ver2[$i]} ]; then
+            #version 1 is greater
+            i_result=1
+        else
+            #version 2 is greater
+            i_result=2
+        fi
+        break
+    done
+    echo $i_result
+}
+
+check_kernel_version() {
+    echo "------------------------------"
+    echo "Operating System Support Check"
+    echo "------------------------------"
+    current_kernel_version=`uname -r |cut -d- -f1`
+    supported_kernel_version='5.14.0'
+    status=$(version_compare $supported_kernel_version $current_kernel_version)
+    if [ $? -ne 0 ]; then
+        echo "Failed to compare the version"
+        exit 1
+    fi
+    if [ $status -eq 1 ]; then
+        # Installed version is less than 7.0.0
+        echo "Error: Found kernel version $current_kernel_version."
+        echo "Version $product_version agent installer is only supported for Linux kernel versions $supported_kernel_version or higher. You must re-run the installer on a new VM with Redhat/Alma/Rocky Linux 9 as the base Operating System"
+        exit 1
+    else
+        echo "Current Kernel version $current_kernel_version is supported for agent installation"
+    fi
+}
+
+f_script_name="agent-$product_version"
+time_stamp=$(date +"%F"-"%s")
+mkdir -p /var/log/cyops
+f_log="/var/log/cyops/${f_script_name}-${time_stamp}.log"
+touch $f_log
+f_file_descriptor_3="/dev/fd/3"
+exec 3>&1 1>>${f_log} 2>&1
+
+if [ "X$config_update" = "XTrue" ]; then
+  {
+    check_kernel_version
+    set_locale
+    install_basic_package
+    identify_bytes_to_skip
+    extract_archive
+    move_file_to_integration
+    check_if_upgrade
+    pre_validate_script
+    write_tmp_config_file
+    can_connect_sme
+    write_config_file
+    change_file_ownership
+    post_config_update
+    restart_service skip_postgres_restart
+  } | awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush(); }' | tee $f_file_descriptor_3
+  exit 0
+fi
+
+{
+  check_kernel_version
+  set_locale
+  install_basic_package
+  identify_bytes_to_skip
+  extract_archive
+  move_file_to_integration
+  check_if_upgrade
+  identify_existing_agent
+  pre_validate_script
+  disable_existing_postgres_repo
+  add_enable_repo
+  install_configure_postgres
+  install_upgrade_agent
+  create_csagent_symlink
+  remove_repo
+  write_config_file
+  change_file_ownership
+  databse_migrate
+  create_cache_table
+  restart_service
+  install_gcc
+  install_update_connectors
+  install_connector_dep
+  collect_logs
+  restart_service skip_postgres_restart
+} | awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush(); }' | tee $f_file_descriptor_3
+
+exit 0
+
+__PAYLOAD_STARTS_AFTER_THIS__
+ã      Ì]s€∏1œ˙®;WR©M[∂Âd<£ô∫é›Ûúì∏âÛpÁ…p íS$Äv‘L˛{w~Å§≈æªˆÅ˚ Q‡Óbw±_ DÁ,V˛ÇE)^∫zˆG¿¿—·!~è^åGÊ˚‡@èÔÌÌÔøèüçè∆££@;z∂7Ï>#{à4»§¢Çêg3)vx¨ÿ\P≈ìX6Ò‚9èø¸˝π∞µµENìt%¯|°⁄BHmƒ=í˝ΩΩódæˆ…y"èô"q‡ÊIç)â`íâ;‚˘€w◊oŒÆ…È€7ÁØŒﬁ\_ú\íøU„WÔﬁ^Ωª8ª>y˜+yˇˆ√ª”3@}ufÕÕ‚êÄ|æLaV2•íø>…$.û%|G¨>í»‚)Â∑¥ƒ[ï√RF≈£‚KV<ØË≤ˇOg<bÉôHñöçB∏pIí#ù}QLƒ4:≠^ÇDz)Uãè}·R…¡@€„_˛˘≈ÂŸ{ˇ◊ì◊ódBn@kBú›$Uª¡*I•Âàª÷è âg|.w©é[ÛÀ[-#Á„`€≈ïur˝3∞‹åYîÃù¡ `B˘4Yëé¶|˜`7Â¡mÑÔÕÿ¡t<ùÓåÇÒﬁŒ·xÃv¶„ótÁE∞?ŒF/èÄ… à®î‰ıø?(…„ÅV)d3‚˚<Ê ˜]…¢Ÿ∂ÿGÀ»…õ$f√cçâÄhb™XË«ÏµãYÄ¢ÇdÁ`YV‚Ú©≥™òTåjØÅº˛≥Df¿“&mPµVk–1‡È_ yË£˘Ë6n˘§πMÍúáïyD⁄Hƒ&≠ô®úÎ∑rlñb<-n⁄™›s¿IRª¯nõ8¬*+ΩöŒÀ“÷D+‰E	+’∂…%¸fb¢ﬂùgQd~á%/¡T&‚úU•w»±JUÆç≤∫+(±j,È ÑìGS– t◊˙∑3¥Ët(÷<Î«¯Ï}"¬◊IòE¨à’\∂ Mæ,≈P«/ÙF∞Z√ZπñZè∫ìÍ$ñh~◊π8óAºè_¢˜˚˝KpÎmFI¶“L¡
+2¶Ò§<umÂÄú®úƒ”π;ü¶–Î∏…^ÀJπdï6v1'ôQX€–xÃôâ8&?IÌh%*é8‰ß|r[ÆvX’Ldn"€b~| *-Îñ.dRÖ/ñükôB;‘w"∆å›8‘´7t…úèEÁ?g u¥syÇNß\-?{à\sÆÇGö´PÒ®{ˆCK aõÎÇ¡ZNAΩçD´∞€ú†ŒmƒÒ:®±†_Wå˜NV÷Ru=BmÊ=π°äàÿ!_Ã7”∂≥v¨%ˇFÏ4bõ˛éï—ËÁMï∫[£÷b_≠“Õ±ØyXO<ﬂ£
+"ƒ),lµ<ÑB√e∑æèa8Ï*Æ7éA˝éWm¬ˇ«˛Ö≠~W}-~´{ÀV?™≠≈ΩYQ5†m&@√5Ô7jùF™)æSÀl	≈\∑Z€‰9s	_œoÔÒ…N™UcÜ]ú]∏õE™ÆgÂ€C2Å∂¨Ë=;öèZ≥=ÈÍ≥›M™éÕEwÒWÂqùOªlw‰w{∂2ÁñΩ•—Ø+Áã&V~»"∫ä—^”Sr{˙T)∂L
+;Ó∂cû”;ª5≈æ†@Äê7“0„åfëﬁ)‡À∂ükJäé9©Î— ¸√aã¥±¥≠∞2È∂—º	`}˜a∫ÌN)	Sï°ÿ÷È	–fÎ‡'∫…*ùÔ˝˚À∑fdÕRÉmì|∞Dƒ‡ìˆ‚@9ÎXèî
+¿Ñ8)g;-Î™|W∫ª)Éè∂µ]5üÃ∆*ûèÁVÖı£yî!<)üÕ´ˆì⁄ÛS¨’Ãìé±GÛØyÏ§ˆ<lêj{˜Î›ÔâÓ7\Sá˙gî∑<ûWéÂV^Wo∞aOèïªı!¶Sÿ¯´w“|∂"A&¨ ûÑ*=Æå,©Ñ	∂∫5r1jª“n}πdlJ[«ñ¶µs∞f√÷⁄ˇWÔ:˚Å¸¥ìâdnG≈0V∏€jøÕµƒ∑?dZhô Å|›R∂hıÏ5?(Éù˜ßK&%ù◊èá”fù„ôâ%>6]ykV≠P9ßYxﬂ¨q>eH}hΩ≤œ√ı≠<è¡Ö‚Äy˜"l4`»çÁLKâ'Øa1‚)§¢%ç=á¸ΩöœÓ)ìLA0†©ê˛d%Y1ñŒô'ÿ2Ïs∆§zÄÈ£]è¢rGc¸éÉ⁄u'æñﬂi—¿<1ãL«]∫∂l»ìä$Ö~í3Èá<¿û¯´£[+Ë˛ÙÓ„ò84M#Ëì¿]º;pæ≠aQf*ypUªœü7¶vâÎMëÃO≥iƒÂ¬-Vyb9¿&≥∂‹ì⁄Û&§”$\M–©7AÆîöTè–5W@˛ïQõÖEô<Œ≤(Zmu[¨ôÆ6ŒÁé>≠$˜hÓInq<®ÑvZ	ó5zfsZ˘ÿå√3jÑzy¥–È¶e›f™¡⁄íI_%v“iÁ9s…≥Qñ—®VíybéBoJ/ÃñicøÚµ•¯RlC†·Ö.>z¯·⁄’9πÓ@eeqc©7Ñ÷aãNèøµ…ôd"`†Èqi›¨r$8Æ¢F-mŸÅKıbÎÑÇwÚÑªìß⁄‹:’∑ »z]Ï§KOÂ2x	ôDaUô*…|xW]ˆÄãk’Ã®&iﬁ¡õd˙	5øŸÙ~„)û/πkôBïp<Å rÓ·£$º∏Ú_ùù_û\üΩ™ï◊$Q√‘çß˚kƒñ£*‚ XÒZÙ‚Bnd.Ò"+ëﬁ=çn◊1±√π %jÌ®ú°T˘ï¨˜)·±k¶EÙv„cÂ›Æò;ã-æ…ï;˛X[ú â"àu?JÊÚˇ2àA0≥é;>äq\◊›;*&ÿ‹¶Ÿá™˙z)∑‰ø‹Çxh]95Ÿt›‡‘YlÛÛ◊í©M◊Íº ®©£∏ˆﬁ.’muZﬂ´E)—í@o¬ºúÄ(PqqK SÎmLGåÿNuUò’ãe—;1≤Â≈}n[b⁄(éSt3?obÄ“¸¬õ≤Ûù[p’—nCíÚe◊V œı’ﬂ(∫2>¬◊ß$y‚Ù…€±≠OG™ﬁ0WˇP≤ÆgÎ<xw†‹I⁄yZ√7€Rkv	\ªÌ;÷^ÿZO”:C)6c‡Ys~y˝KGoò@VƒX4¡é1p¸k∂éæèÈéÚÿ˜√¥Ë∂&˙Íúä˘›Õ»\±Êaù#47U[W«Ç.∫„U…º~
+É,k^˘9„*˜§j:Ì>x‹+ãYéÒŸœØ!ÄíˇI$'y¨‹dÔÎâ§`·5∂â÷<,j2¨eÈNnVˇ/‹◊/ ™ÖØ7˙uÜÖZ7?ˆOµL;˛Õ3Ù:
+πÍæS*≤ÆΩ,u˙_ˇŸ¨ázË°ázË°ázË°ázË°ázË°ázË°ázË°ázË°ázË°áz¯]‡øIŒ®7 P  
